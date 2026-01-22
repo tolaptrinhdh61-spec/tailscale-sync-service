@@ -78,8 +78,7 @@ jobs:
                   }
                 }
               },
-              "expirySeconds": 3600,
-              "description": "GitHub Actions Runner - Auto-generated"
+              "expirySeconds": 3600
             }' \
             "https://api.tailscale.com/api/v2/tailnet/-/keys")
 
