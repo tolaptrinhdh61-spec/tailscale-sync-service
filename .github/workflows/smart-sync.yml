@@ -46,7 +46,7 @@ jobs:
             -d "client_id=${CLIENT_ID}" \
             -d "client_secret=${CLIENT_SECRET}" \
             -d "grant_type=client_credentials" \
-            -d "scope=devices:read devices:write auth_keys:write tailnet:read")
+            -d "scope=all")
 
           echo "$RESPONSE" | jq .
 
