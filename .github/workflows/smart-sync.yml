@@ -78,11 +78,13 @@ jobs:
               "capabilities": {
                 "devices": {
                   "create": {
-                    "reusable": false,
+                    "reusable": true,
                     "ephemeral": true,
                     "preauthorized": true
                   }
                 }
+                "expirySeconds": 7776000,
+                "description": ""
               }
             }')
 
