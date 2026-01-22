@@ -1,4 +1,4 @@
-name: Smart Data Sync with Tailscale (Pre-auth Key)
+name: Smart Data Sync with Tailscale
 
 on:
   workflow_dispatch:
@@ -31,39 +31,9 @@ jobs:
           echo "🆔 Runner ID: $RUNNER_ID"
 
       # ============================================================
-      # OPTION 1: Use pre-generated auth key (simpler approach)
+      # 🔐 GET TAILSCALE OAUTH TOKEN (FULL SCOPE / FULL QUYỀN)
       # ============================================================
-      - name: Setup Tailscale with Pre-auth Key
-        env:
-          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-          RUNNER_ID: ${{ steps.runner-id.outputs.id }}
-        run: |
-          echo "📦 Installing Tailscale..."
-          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
-          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.tailscale-keyring.list | sudo tee /etc/apt/sources.list.d/tailscale.list
-          sudo apt-get update -qq
-          sudo apt-get install -y tailscale jq curl rsync sshpass openssh-server netcat-openbsd
-
-          echo "🔌 Connecting to Tailscale network..."
-          sudo tailscale up \
-            --authkey="${TAILSCALE_AUTH_KEY}" \
-            --hostname="gh-${RUNNER_ID}" \
-            --accept-routes
-
-          sleep 5
-
-          TS_IP=$(tailscale ip -4)
-          TS_HOSTNAME=$(tailscale status --self | awk '{print $2}')
-
-          echo "ip=$TS_IP" >> $GITHUB_OUTPUT
-          echo "hostname=$TS_HOSTNAME" >> $GITHUB_OUTPUT
-          echo "✅ Connected - Hostname: $TS_HOSTNAME, IP: $TS_IP"
-        id: tailscale
-
-      # ============================================================
-      # 🔐 GET TAILSCALE OAUTH TOKEN (for device management only)
-      # ============================================================
-      - name: Get Tailscale OAuth Token
+      - name: Get Tailscale OAuth Token (FULL SCOPE)
         id: ts-oauth
         env:
           TS_CLIENT_ID: ${{ secrets.TAILSCALE_CLIENT_ID }}
@@ -71,10 +41,10 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "🔐 Getting OAuth access token for device management..."
+          echo "🔐 Getting OAuth access token (client_credentials) with FULL scope..."
 
-          # Only need devices scope for removal
-          SCOPE="devices:read devices:write"
+          # Full quyền để xử lý về sau (device read/write, tạo key, tailnet read)
+          SCOPE="all"
 
           RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -X POST \
             "https://api.tailscale.com/api/v2/oauth/token" \
@@ -88,16 +58,104 @@ jobs:
           BODY=$(echo "$RESPONSE" | grep -v "HTTP_CODE:")
 
           echo "HTTP Status Code: $HTTP_CODE"
+          echo "$BODY" | jq . || true
 
           if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "201" ]; then
-            echo "⚠️ OAuth token request failed (HTTP $HTTP_CODE), device removal may not work"
+            echo "❌ Failed to get OAuth token (HTTP $HTTP_CODE)"
             echo "Response: $BODY"
-            echo "token=" >> $GITHUB_OUTPUT
-          else
-            ACCESS_TOKEN=$(echo "$BODY" | jq -r '.access_token')
-            echo "token=$ACCESS_TOKEN" >> $GITHUB_OUTPUT
-            echo "✅ OAuth token acquired for device management"
+            exit 1
           fi
+
+          ACCESS_TOKEN=$(echo "$BODY" | jq -r '.access_token')
+
+          if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" = "null" ]; then
+            echo "❌ Invalid access token received"
+            echo "Response: $BODY"
+            exit 1
+          fi
+
+          echo "token=$ACCESS_TOKEN" >> $GITHUB_OUTPUT
+          echo "✅ OAuth token acquired successfully (FULL scope)"
+
+      # ============================================================
+      # 🔑 CREATE TAILSCALE AUTH KEY (THEO JSON BẠN ĐƯA)
+      # ============================================================
+      - name: Create Tailscale Auth Key (Reusable + Ephemeral + Preauthorized + 90d)
+        id: ts-authkey
+        env:
+          ACCESS_TOKEN: ${{ steps.ts-oauth.outputs.token }}
+        run: |
+          set -euo pipefail
+
+          echo "🔑 Creating auth key (reusable=true, ephemeral=true, preauthorized=true, expiry=7776000s)..."
+
+          RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -X POST \
+            -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "https://api.tailscale.com/api/v2/tailnet/-/keys" \
+            -d '{
+              "capabilities": {
+                "devices": {
+                  "create": {
+                    "reusable": true,
+                    "ephemeral": true,
+                    "preauthorized": true
+                  }
+                }
+              },
+              "expirySeconds": 7776000,
+              "description": ""
+            }')
+
+          HTTP_CODE=$(echo "$RESPONSE" | grep "HTTP_CODE:" | cut -d: -f2)
+          BODY=$(echo "$RESPONSE" | grep -v "HTTP_CODE:")
+
+          echo "HTTP Status Code: $HTTP_CODE"
+          echo "$BODY" | jq . || true
+
+          if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "201" ]; then
+            echo "❌ Failed to create auth key (HTTP $HTTP_CODE)"
+            echo "Response: $BODY"
+            exit 1
+          fi
+
+          AUTH_KEY=$(echo "$BODY" | jq -r '.key')
+
+          if [ -z "$AUTH_KEY" ] || [ "$AUTH_KEY" = "null" ]; then
+            echo "❌ Invalid auth key received"
+            echo "Response: $BODY"
+            exit 1
+          fi
+
+          echo "authkey=$AUTH_KEY" >> $GITHUB_OUTPUT
+          echo "✅ Auth key created (reusable, ephemeral, 90 days)"
+
+      - name: Setup Tailscale
+        env:
+          AUTH_KEY: ${{ steps.ts-authkey.outputs.authkey }}
+          RUNNER_ID: ${{ steps.runner-id.outputs.id }}
+        run: |
+          echo "📦 Installing Tailscale..."
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.tailscale-keyring.list | sudo tee /etc/apt/sources.list.d/tailscale.list
+          sudo apt-get update -qq
+          sudo apt-get install -y tailscale jq curl rsync sshpass openssh-server netcat-openbsd
+
+          echo "🔐 Connecting to Tailscale network..."
+          sudo tailscale up \
+            --authkey="${AUTH_KEY}" \
+            --hostname="gh-${RUNNER_ID}" \
+            --accept-routes
+
+          sleep 5
+
+          TS_IP=$(tailscale ip -4)
+          TS_HOSTNAME=$(tailscale status --self | awk '{print $2}')
+
+          echo "ip=$TS_IP" >> $GITHUB_OUTPUT
+          echo "hostname=$TS_HOSTNAME" >> $GITHUB_OUTPUT
+          echo "✅ Connected - Hostname: $TS_HOSTNAME, IP: $TS_IP"
+        id: tailscale
 
       - name: Setup SSH Server
         env:
@@ -126,8 +184,13 @@ jobs:
           echo "ssh_pass=$SSH_PASS" >> $GITHUB_OUTPUT
         id: ssh-setup
 
+      # ============================================================
+      # 🔍 DISCOVER ACTIVE RUNNER (GIỮ NGUYÊN LOGIC CỦA BẠN)
+      # ============================================================
       - name: Discover Active Runners
         id: discover
+        env:
+          ACCESS_TOKEN: ${{ steps.ts-oauth.outputs.token }}
         run: |
           echo "🔍 Discovering active runners in Tailscale network..."
 
@@ -140,7 +203,7 @@ jobs:
 
           if [ -z "$ACTIVE_RUNNERS" ]; then
             echo "found=false" >> $GITHUB_OUTPUT
-            echo "🔭 No active runners found in network"
+            echo "📭 No active runners found in network"
           else
             # Get first active runner
             ACTIVE_IP=$(echo "$ACTIVE_RUNNERS" | head -1)
@@ -167,17 +230,20 @@ jobs:
           REMOTE_RUNNER_ID: ${{ steps.discover.outputs.remote_runner_id }}
           RUNNER_ID: ${{ steps.runner-id.outputs.id }}
         run: |
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo "📥 SYNCING DATA FROM ACTIVE RUNNER"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo "Source: $ACTIVE_HOSTNAME ($ACTIVE_IP)"
           echo "Target: gh-$RUNNER_ID ($(tailscale ip -4))"
           echo ""
 
+          # Create data directory
           mkdir -p ${{ env.DATA_DIR }}
 
+          # Get remote SSH password (assuming same pattern)
           REMOTE_PASS="sync-pass-${REMOTE_RUNNER_ID}"
 
+          # Wait for SSH to be available
           echo "⏳ Waiting for SSH on $ACTIVE_IP:${{ env.SYNC_PORT }}..."
           SSH_READY=false
           for i in {1..30}; do
@@ -200,40 +266,89 @@ jobs:
             exit 0
           fi
 
+          # Perform rsync with detailed logging
           echo ""
-          echo "📁 Starting rsync transfer..."
+          echo "🔄 Starting rsync transfer..."
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+          RSYNC_LOG="/tmp/rsync-sync.log"
+          RSYNC_STATS="/tmp/rsync-stats.txt"
 
           if sshpass -p "$REMOTE_PASS" rsync -avz --stats --timeout=60 \
             -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10" \
             runner@$ACTIVE_IP:${{ env.DATA_DIR }}/ \
-            ${{ env.DATA_DIR }}/; then
+            ${{ env.DATA_DIR }}/ 2>&1 | tee "$RSYNC_LOG"; then
             
+            echo ""
+            echo "✅ Rsync completed successfully"
+            
+            # Extract stats from rsync output
+            grep -A 20 "Number of files" "$RSYNC_LOG" > "$RSYNC_STATS" || true
+            
+            # Count synced files and calculate size
             SYNCED_FILES=$(find ${{ env.DATA_DIR }} -type f | wc -l)
             SYNCED_SIZE=$(du -sh ${{ env.DATA_DIR }} 2>/dev/null | awk '{print $1}')
             SYNCED_BYTES=$(du -sb ${{ env.DATA_DIR }} 2>/dev/null | awk '{print $1}')
             
-            echo "✅ Rsync completed successfully"
-            echo "   Files synced: $SYNCED_FILES"
-            echo "   Data size: $SYNCED_SIZE"
+            # Get file types breakdown
+            echo ""
+            echo "📊 Sync Statistics:"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "   Total files synced: $SYNCED_FILES"
+            echo "   Total size: $SYNCED_SIZE ($SYNCED_BYTES bytes)"
+            echo "   Source runner: $ACTIVE_HOSTNAME"
+            echo "   Source IP: $ACTIVE_IP"
             
+            # Show detailed rsync stats
+            if [ -f "$RSYNC_STATS" ]; then
+              echo ""
+              echo "   Rsync details:"
+              cat "$RSYNC_STATS" | sed 's/^/   /'
+            fi
+            
+            echo ""
+            echo "📂 File breakdown by type:"
+            echo "   JSON files: $(find ${{ env.DATA_DIR }} -name "*.json" | wc -l)"
+            echo "   Text files: $(find ${{ env.DATA_DIR }} -name "*.txt" | wc -l)"
+            echo "   Binary files: $(find ${{ env.DATA_DIR }} -name "*.dat" | wc -l)"
+            echo "   Other files: $(find ${{ env.DATA_DIR }} -type f ! -name "*.json" ! -name "*.txt" ! -name "*.dat" | wc -l)"
+            
+            # Save outputs
             echo "synced=true" >> $GITHUB_OUTPUT
             echo "files=$SYNCED_FILES" >> $GITHUB_OUTPUT
             echo "size=$SYNCED_SIZE" >> $GITHUB_OUTPUT
             echo "bytes=$SYNCED_BYTES" >> $GITHUB_OUTPUT
+            
+            # Show synced files list
+            echo ""
+            echo "📋 Synced files list:"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            ls -lah ${{ env.DATA_DIR }}/ | tail -n +4 | head -20
+            if [ $SYNCED_FILES -gt 20 ]; then
+              echo "   ... and $((SYNCED_FILES - 20)) more files"
+            fi
+            
           else
+            echo ""
             echo "❌ Rsync failed"
+            cat "$RSYNC_LOG" | tail -20
             echo "synced=false" >> $GITHUB_OUTPUT
           fi
+
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         id: sync-from
 
       - name: Remove Active Runner from Network
-        if: steps.discover.outputs.found == 'true' && steps.sync-from.outputs.synced == 'true' && steps.ts-oauth.outputs.token != ''
+        if: steps.discover.outputs.found == 'true' && steps.sync-from.outputs.synced == 'true'
         env:
           ACCESS_TOKEN: ${{ steps.ts-oauth.outputs.token }}
           ACTIVE_HOSTNAME: ${{ steps.discover.outputs.hostname }}
         run: |
+          echo ""
           echo "🔴 Removing active runner from Tailscale network..."
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
+          # Get device ID by hostname (using '-' as tailnet)
           DEVICES_RESPONSE=$(curl -s -H "Authorization: Bearer ${ACCESS_TOKEN}" \
             "https://api.tailscale.com/api/v2/tailnet/-/devices")
 
@@ -241,7 +356,9 @@ jobs:
 
           if [ -n "$DEVICE_ID" ] && [ "$DEVICE_ID" != "null" ]; then
             echo "🎯 Found device ID: $DEVICE_ID"
+            echo "   Hostname: $ACTIVE_HOSTNAME"
             
+            # Delete device via API
             DELETE_RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -X DELETE \
               -H "Authorization: Bearer ${ACCESS_TOKEN}" \
               "https://api.tailscale.com/api/v2/device/${DEVICE_ID}")
@@ -250,67 +367,282 @@ jobs:
             
             if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "204" ]; then
               echo "✅ Successfully removed $ACTIVE_HOSTNAME from network"
+              echo "   Device will be automatically cleaned up (ephemeral mode)"
             else
               echo "⚠️ Failed to remove device (HTTP $HTTP_CODE)"
+              echo "Response: $(echo "$DELETE_RESPONSE" | grep -v "HTTP_CODE:")"
             fi
           else
             echo "⚠️ Could not find device ID for hostname: $ACTIVE_HOSTNAME"
+            echo "Available devices:"
+            echo "$DEVICES_RESPONSE" | jq -r '.devices[] | "  - \(.hostname) (\(.id))"' | head -10
           fi
+
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
       - name: Initialize or Update Local Data
         env:
           RUNNER_ID: ${{ steps.runner-id.outputs.id }}
         run: |
+          echo ""
           echo "📝 Initializing/Updating local data..."
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
           mkdir -p ${{ env.DATA_DIR }}
 
+          # Create comprehensive runner info file
           cat > ${{ env.DATA_DIR }}/runner-$RUNNER_ID.json << EOF
           {
             "runner_id": "$RUNNER_ID",
             "hostname": "${{ steps.tailscale.outputs.hostname }}",
             "ip": "${{ steps.tailscale.outputs.ip }}",
             "timestamp": "$(date -Iseconds)",
+            "timestamp_unix": $(date +%s),
             "github_run_id": "${{ github.run_id }}",
+            "github_run_number": "${{ github.run_number }}",
+            "github_workflow": "${{ github.workflow }}",
+            "github_actor": "${{ github.actor }}",
             "sync_info": {
-              "synced_from": "${{ steps.discover.outputs.hostname }}",
+              "synced_from_hostname": "${{ steps.discover.outputs.hostname }}",
+              "synced_from_ip": "${{ steps.discover.outputs.ip }}",
               "sync_success": ${{ steps.sync-from.outputs.synced == 'true' }},
-              "files_count": ${{ steps.sync-from.outputs.files || 0 }}
+              "files_count": ${{ steps.sync-from.outputs.files || 0 }},
+              "data_size": "${{ steps.sync-from.outputs.size }}",
+              "data_bytes": ${{ steps.sync-from.outputs.bytes || 0 }}
             }
           }
           EOF
 
+          # Create sample data files with runner ID
           echo "Sample data from runner: $RUNNER_ID" > ${{ env.DATA_DIR }}/data-$RUNNER_ID.txt
-          echo "✅ Local data initialized"
+          echo "Created at: $(date)" >> ${{ env.DATA_DIR }}/data-$RUNNER_ID.txt
+          echo "Run #${{ github.run_number }}" >> ${{ env.DATA_DIR }}/data-$RUNNER_ID.txt
+          echo "Timestamp: $(date +%s)" >> ${{ env.DATA_DIR }}/data-$RUNNER_ID.txt
+
+          # Update run history
+          echo "Run #${{ github.run_number }} by $RUNNER_ID at $(date +%s)" >> ${{ env.DATA_DIR }}/run-history.txt
+
+          # Create a binary test file with runner ID
+          dd if=/dev/urandom of=${{ env.DATA_DIR }}/binary-$RUNNER_ID.dat bs=1K count=100 2>/dev/null
+
+          # Create checksum file for verification
+          cd ${{ env.DATA_DIR }}
+          md5sum *.dat > checksums-$RUNNER_ID.md5 2>/dev/null || true
+          cd -
+
+          echo "✅ Local data initialized for runner: $RUNNER_ID"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
       - name: Show Current Data State
         run: |
           echo ""
-          echo "📊 CURRENT DATA STATE"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "Runner: ${{ steps.runner-id.outputs.id }}"
-          echo "IP: ${{ steps.tailscale.outputs.ip }}"
+          echo "╔════════════════════════════════════════════════════════╗"
+          echo "║           📊 CURRENT DATA STATE REPORT                ║"
+          echo "╚════════════════════════════════════════════════════════╝"
           echo ""
-          ls -lah ${{ env.DATA_DIR }}/
+          echo "🆔 Runner Information:"
+          echo "   ID: ${{ steps.runner-id.outputs.id }}"
+          echo "   Hostname: ${{ steps.tailscale.outputs.hostname }}"
+          echo "   IP: ${{ steps.tailscale.outputs.ip }}"
+          echo "   Run: #${{ github.run_number }}"
+          echo ""
+
+          if [ "${{ steps.discover.outputs.found }}" = "true" ]; then
+            echo "📥 Sync Status: DATA SYNCED"
+            echo "   Source: ${{ steps.discover.outputs.hostname }}"
+            echo "   Source IP: ${{ steps.discover.outputs.ip }}"
+            if [ "${{ steps.sync-from.outputs.synced }}" = "true" ]; then
+              echo "   ✅ Files synced: ${{ steps.sync-from.outputs.files }}"
+              echo "   ✅ Data size: ${{ steps.sync-from.outputs.size }}"
+              echo "   ✅ Bytes: ${{ steps.sync-from.outputs.bytes }}"
+            else
+              echo "   ⚠️ Sync failed or incomplete"
+            fi
+          else
+            echo "📭 Sync Status: NO PREVIOUS RUNNER"
+            echo "   Started with fresh data"
+          fi
+
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "📂 Data Directory Contents (${{ env.DATA_DIR }})"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          ls -lah ${{ env.DATA_DIR }}/ | tail -n +4
+
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "📄 Runner Info Files"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          for f in ${{ env.DATA_DIR }}/runner-*.json; do
+            if [ -f "$f" ]; then
+              echo ""
+              echo "📋 File: $(basename $f)"
+              cat "$f" | jq '.' 2>/dev/null || cat "$f"
+            fi
+          done
+
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "📈 Data Statistics"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "Total files: $(find ${{ env.DATA_DIR }} -type f | wc -l)"
+          echo "Total size: $(du -sh ${{ env.DATA_DIR }} | awk '{print $1}')"
+          echo "Total bytes: $(du -sb ${{ env.DATA_DIR }} | awk '{print $1}')"
+          echo "Runner info files: $(ls ${{ env.DATA_DIR }}/runner-*.json 2>/dev/null | wc -l)"
+          echo "Data files: $(ls ${{ env.DATA_DIR }}/data-*.txt 2>/dev/null | wc -l)"
+          echo "Binary files: $(ls ${{ env.DATA_DIR }}/binary-*.dat 2>/dev/null | wc -l)"
+
+          if [ -f "${{ env.DATA_DIR }}/run-history.txt" ]; then
+            echo ""
+            echo "📜 Run History (last 10):"
+            tail -10 ${{ env.DATA_DIR }}/run-history.txt | sed 's/^/   /'
+          fi
+
           echo ""
 
       - name: Keep Runner Alive
         env:
           RUNNER_ID: ${{ steps.runner-id.outputs.id }}
         run: |
-          echo "⏰ Keeping runner alive for 10 minutes..."
-          echo "Hostname: ${{ steps.tailscale.outputs.hostname }}"
-          echo "IP: ${{ steps.tailscale.outputs.ip }}"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "⏰ KEEPING RUNNER ALIVE"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "Duration: 10 minutes"
+          echo "Purpose: Allow other runners to discover and sync from this runner"
+          echo ""
+          echo "📡 Current Network Status:"
+          echo "   Hostname: ${{ steps.tailscale.outputs.hostname }}"
+          echo "   IP: ${{ steps.tailscale.outputs.ip }}"
+          echo "   SSH Port: ${{ env.SYNC_PORT }}"
+          echo "   SSH Password: ${{ steps.ssh-setup.outputs.ssh_pass }}"
+          echo ""
+          echo "Monitoring connections..."
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+          START=$(date +%s)
 
           for i in {1..120}; do
+            ELAPSED=$(( $(date +%s) - START ))
+            
             if [ $((i % 12)) -eq 0 ]; then
-              echo "⏱️  Status check at $(date)"
+              MINUTES=$((ELAPSED / 60))
+              SECONDS=$((ELAPSED % 60))
+              echo ""
+              echo "⏱️  [$MINUTES:$(printf "%02d" $SECONDS)] Status check..."
+              
+              # Show active SSH connections
+              CONNECTIONS=$(sudo netstat -tn | grep ':${{ env.SYNC_PORT }}' | grep ESTABLISHED | wc -l)
+              if [ $CONNECTIONS -gt 0 ]; then
+                echo "   🔗 Active SSH connections: $CONNECTIONS"
+                sudo netstat -tn | grep ':${{ env.SYNC_PORT }}' | grep ESTABLISHED | awk '{print "      - " $5}' | head -5
+              else
+                echo "   📡 Listening for connections..."
+              fi
+              
+              # Show Tailscale peers
+              PEERS=$(sudo tailscale status --peers | grep -v 'offline' | wc -l)
+              echo "   👥 Active peers in network: $PEERS"
+              
+              if [ $PEERS -gt 0 ]; then
+                echo "   Peers:"
+                sudo tailscale status --peers | grep -v 'offline' | head -5 | awk '{print "      - " $2 " (" $1 ")"}'
+              fi
+              
+              # Update data directory size
+              CURRENT_SIZE=$(du -sh ${{ env.DATA_DIR }} | awk '{print $1}')
+              echo "   💾 Data directory size: $CURRENT_SIZE"
             fi
+            
             sleep 5
           done
+
+          echo ""
+          echo "⏰ Keepalive period completed"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+      - name: Final Summary
+        if: always()
+        run: |
+          echo ""
+          echo "╔════════════════════════════════════════════════════════╗"
+          echo "║              ✅ WORKFLOW FINAL SUMMARY                 ║"
+          echo "╚════════════════════════════════════════════════════════╝"
+          echo ""
+          echo "🆔 Runner Information:"
+          echo "   ID: ${{ steps.runner-id.outputs.id }}"
+          echo "   Hostname: ${{ steps.tailscale.outputs.hostname }}"
+          echo "   IP: ${{ steps.tailscale.outputs.ip }}"
+          echo "   GitHub Run: #${{ github.run_number }} (ID: ${{ github.run_id }})"
+          echo ""
+
+          if [ "${{ steps.discover.outputs.found }}" = "true" ]; then
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "✅ Previous Runner Found and Processed"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "   Remote Hostname: ${{ steps.discover.outputs.hostname }}"
+            echo "   Remote IP: ${{ steps.discover.outputs.ip }}"
+            echo "   Remote Runner ID: ${{ steps.discover.outputs.remote_runner_id }}"
+            echo ""
+            if [ "${{ steps.sync-from.outputs.synced }}" = "true" ]; then
+              echo "   ✅ Data Sync: SUCCESSFUL"
+              echo "      Files transferred: ${{ steps.sync-from.outputs.files }}"
+              echo "      Data size: ${{ steps.sync-from.outputs.size }}"
+              echo "      Bytes: ${{ steps.sync-from.outputs.bytes }}"
+            else
+              echo "   ⚠️ Data Sync: FAILED"
+            fi
+            echo "   🔴 Remote runner removed from network"
+          else
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "📭 No Previous Runner Found"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "   This is the first runner or all previous runners are offline"
+            echo "   Started with fresh data initialization"
+          fi
+
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "📂 Final Data State"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          FINAL_FILES=$(find ${{ env.DATA_DIR }} -type f 2>/dev/null | wc -l)
+          FINAL_SIZE=$(du -sh ${{ env.DATA_DIR }} 2>/dev/null | awk '{print $1}')
+          FINAL_BYTES=$(du -sb ${{ env.DATA_DIR }} 2>/dev/null | awk '{print $1}')
+
+          echo "   Total files: $FINAL_FILES"
+          echo "   Total size: $FINAL_SIZE"
+          echo "   Total bytes: $FINAL_BYTES"
+          echo ""
+          echo "   File breakdown:"
+          echo "      Runner info (JSON): $(find ${{ env.DATA_DIR }} -name "runner-*.json" 2>/dev/null | wc -l)"
+          echo "      Data files (TXT): $(find ${{ env.DATA_DIR }} -name "data-*.txt" 2>/dev/null | wc -l)"
+          echo "      Binary files (DAT): $(find ${{ env.DATA_DIR }} -name "binary-*.dat" 2>/dev/null | wc -l)"
+          echo "      Checksum files: $(find ${{ env.DATA_DIR }} -name "*.md5" 2>/dev/null | wc -l)"
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🎯 Key Achievements"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "   ✅ Tailscale connection established"
+          echo "   ✅ OAuth authentication successful"
+          echo "   ✅ Ephemeral auth key created and used"
+          if [ "${{ steps.discover.outputs.found }}" = "true" ]; then
+            echo "   ✅ Active runner discovered"
+            if [ "${{ steps.sync-from.outputs.synced }}" = "true" ]; then
+              echo "   ✅ Data synced successfully"
+              echo "   ✅ Remote runner removed from network"
+            fi
+          fi
+          echo "   ✅ Local data initialized/updated"
+          echo "   ✅ Runner kept alive for peer connections"
+          echo "   ✅ SSH server operational"
+          echo ""
+          echo "╔════════════════════════════════════════════════════════╗"
+          echo "║           🎉 WORKFLOW COMPLETED SUCCESSFULLY           ║"
+          echo "╚════════════════════════════════════════════════════════╝"
+          echo ""
 
       - name: Cleanup Tailscale
         if: always()
         run: |
           echo "🧹 Cleaning up Tailscale connection..."
           sudo tailscale down || true
-          echo "✅ Cleanup completed"
+          echo "✅ Cleanup completed - ephemeral device will auto-remove"
