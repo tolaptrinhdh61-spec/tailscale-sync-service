@@ -30,50 +30,47 @@ jobs:
           echo "id=$RUNNER_ID" >> $GITHUB_OUTPUT
           echo "🆔 Runner ID: $RUNNER_ID"
 
-      # ============================================================
-      # 🔐 GET TAILSCALE OAUTH ACCESS TOKEN (FULL SCOPE)
-      # ============================================================
-      - name: Get Tailscale OAuth Access Token (FULL SCOPE)
+      - name: Get Tailscale OAuth Token with Full Scope
         id: ts-oauth
         env:
-          CLIENT_ID: ${{ secrets.TAILSCALE_CLIENT_ID }}
-          CLIENT_SECRET: ${{ secrets.TAILSCALE_CLIENT_SECRET }}
+          TS_CLIENT_ID: ${{ secrets.TAILSCALE_CLIENT_ID }}
+          TS_CLIENT_SECRET: ${{ secrets.TAILSCALE_CLIENT_SECRET }}
         run: |
-          echo "🔐 Requesting Tailscale OAuth token with FULL scope..."
+          echo "🔐 Getting OAuth access token with FULL SCOPE (all permissions)..."
 
-          RESPONSE=$(curl -s -X POST https://api.tailscale.com/api/v2/oauth/token \
-            -H "Content-Type: application/x-www-form-urlencoded" \
-            -d "client_id=${CLIENT_ID}" \
-            -d "client_secret=${CLIENT_SECRET}" \
-            -d "grant_type=client_credentials" \
-            -d "scope=all")
+          RESPONSE=$(curl -s -f -d "client_id=${TS_CLIENT_ID}" \
+            -d "client_secret=${TS_CLIENT_SECRET}" \
+            -d "scope=all" \
+            https://api.tailscale.com/api/v2/oauth/token)
 
-          echo "$RESPONSE" | jq .
+          if [ $? -ne 0 ]; then
+            echo "❌ Failed to get OAuth token"
+            exit 1
+          fi
 
           ACCESS_TOKEN=$(echo "$RESPONSE" | jq -r '.access_token')
+          SCOPE=$(echo "$RESPONSE" | jq -r '.scope // "default"')
 
           if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" = "null" ]; then
-            echo "❌ Failed to obtain access token"
+            echo "❌ Invalid access token received"
             exit 1
           fi
 
           echo "token=$ACCESS_TOKEN" >> $GITHUB_OUTPUT
-          echo "✅ OAuth token acquired"
+          echo "✅ OAuth token acquired successfully"
+          echo "📋 Scope granted: $SCOPE"
 
-      # ============================================================
-      # 🔑 CREATE EPHEMERAL AUTH KEY
-      # ============================================================
-      - name: Create Ephemeral Auth Key
+      - name: Create Tailscale Auth Key
         id: ts-authkey
         env:
           ACCESS_TOKEN: ${{ steps.ts-oauth.outputs.token }}
         run: |
-          echo "🔑 Creating ephemeral auth key..."
+          echo "🔑 Creating reusable and ephemeral auth key..."
 
-          RESPONSE=$(curl -s -X POST \
+          # Create auth key with API (using '-' as tailnet - auto-detect from token)
+          RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -X POST \
             -H "Authorization: Bearer ${ACCESS_TOKEN}" \
             -H "Content-Type: application/json" \
-            https://api.tailscale.com/api/v2/tailnet/-/keys \
             -d '{
               "capabilities": {
                 "devices": {
@@ -83,43 +80,60 @@ jobs:
                     "preauthorized": true
                   }
                 }
-                "expirySeconds": 7776000,
-                "description": ""
-              }
-            }')
+              },
+              "expirySeconds": 7776000,
+              "description": ""
+            }' \
+            "https://api.tailscale.com/api/v2/tailnet/-/keys")
 
-          echo "$RESPONSE" | jq .
+          HTTP_CODE=$(echo "$RESPONSE" | grep "HTTP_CODE:" | cut -d: -f2)
+          BODY=$(echo "$RESPONSE" | grep -v "HTTP_CODE:")
 
-          AUTH_KEY=$(echo "$RESPONSE" | jq -r '.key')
+          echo "HTTP Status Code: $HTTP_CODE"
+
+          if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "201" ]; then
+            echo "❌ Failed to create auth key (HTTP $HTTP_CODE)"
+            echo "Response: $BODY"
+            exit 1
+          fi
+
+          AUTH_KEY=$(echo "$BODY" | jq -r '.key')
 
           if [ -z "$AUTH_KEY" ] || [ "$AUTH_KEY" = "null" ]; then
-            echo "❌ Failed to create auth key"
+            echo "❌ Invalid auth key received"
+            echo "Response: $BODY"
             exit 1
           fi
 
           echo "authkey=$AUTH_KEY" >> $GITHUB_OUTPUT
-          echo "✅ Ephemeral auth key created"
+          echo "✅ Auth key created (reusable, ephemeral, 90 days expiry)"
 
-      # ============================================================
-      # 🌐 INSTALL & CONNECT TAILSCALE
-      # ============================================================
-      - name: Install Tailscale
-        run: |
-          curl -fsSL https://tailscale.com/install.sh | sh
-
-      - name: Connect to Tailscale
-        id: tailscale
+      - name: Setup Tailscale
         env:
           AUTH_KEY: ${{ steps.ts-authkey.outputs.authkey }}
+          RUNNER_ID: ${{ steps.runner-id.outputs.id }}
         run: |
-          sudo tailscale up \
-            --authkey="$AUTH_KEY" \
-            --hostname="gh-${{ github.run_id }}" \
-            --ssh \
-            --accept-dns=false
+          echo "📦 Installing Tailscale..."
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.tailscale-keyring.list | sudo tee /etc/apt/sources.list.d/tailscale.list
+          sudo apt-get update -qq
+          sudo apt-get install -y tailscale jq curl rsync sshpass openssh-server netcat-openbsd
 
-          echo "hostname=$(hostname)" >> $GITHUB_OUTPUT
-          echo "ip=$(tailscale ip -4)" >> $GITHUB_OUTPUT
+          echo "🔗 Connecting to Tailscale network..."
+          sudo tailscale up \
+            --authkey="${AUTH_KEY}" \
+            --hostname="gh-${RUNNER_ID}" \
+            --accept-routes
+
+          sleep 5
+
+          TS_IP=$(tailscale ip -4)
+          TS_HOSTNAME=$(tailscale status --self | awk '{print $2}')
+
+          echo "ip=$TS_IP" >> $GITHUB_OUTPUT
+          echo "hostname=$TS_HOSTNAME" >> $GITHUB_OUTPUT
+          echo "✅ Connected - Hostname: $TS_HOSTNAME, IP: $TS_IP"
+        id: tailscale
 
       - name: Setup SSH Server
         env:
