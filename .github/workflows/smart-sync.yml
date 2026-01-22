@@ -48,8 +48,7 @@ jobs:
             -d "grant_type=client_credentials" \
             -d "client_id=${TS_CLIENT_ID}" \
             -d "client_secret=${TS_CLIENT_SECRET}" \
-            --data-urlencode "scope=${TS_OAUTH_SCOPE}" \
-            --data-urlencode "tags=${TS_OAUTH_TAGS}" \
+            --data-urlencode "scope=all" \
             "https://api.tailscale.com/api/v2/oauth/token")
 
           HTTP_CODE=$(echo "$RESPONSE" | grep "HTTP_CODE:" | cut -d: -f2)
