@@ -1,4 +1,4 @@
-name: Smart Data Sync with Tailscale
+name: Smart Data Sync with Tailscale (OAuth Secret Login)
 
 on:
   workflow_dispatch:
@@ -11,10 +11,15 @@ on:
 env:
   DATA_DIR: "./.data-runner"
   SYNC_PORT: 22
+  # 👇 Tag mà OAuth client đã được cấp/own (vd tag:ci). Bạn có thể set bằng secret TAILSCALE_TAGS.
+  DEFAULT_TAILSCALE_TAGS: "tag:ci"
 
 jobs:
   smart-runner:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -22,6 +27,7 @@ jobs:
       - name: Generate Runner ID
         id: runner-id
         run: |
+          set -euo pipefail
           if [ -n "${{ github.event.inputs.runner_id }}" ]; then
             RUNNER_ID="${{ github.event.inputs.runner_id }}"
           else
@@ -30,160 +36,82 @@ jobs:
           echo "id=$RUNNER_ID" >> $GITHUB_OUTPUT
           echo "🆔 Runner ID: $RUNNER_ID"
 
-      - name: Get Tailscale OAuth Token
-        id: ts-oauth
-        env:
-          TS_CLIENT_ID: ${{ secrets.TAILSCALE_CLIENT_ID }}
-          TS_CLIENT_SECRET: ${{ secrets.TAILSCALE_CLIENT_SECRET }}
-          # Scope & tags are REQUESTED here, but they must also be GRANTED on the OAuth client in Tailscale admin.
-          # For this workflow we need at least: devices:core (list/delete devices) + auth_keys (create auth keys).
-          TS_OAUTH_SCOPE: "devices:core auth_keys"
-          # Tags matter only when scopes include devices:core, auth_keys, or all.
-          TS_OAUTH_TAGS: "tag:ci"
+      - name: Install packages
         run: |
           set -euo pipefail
-          echo "🔐 Getting OAuth access token (request scope: $TS_OAUTH_SCOPE; tags: $TS_OAUTH_TAGS)..."
+          sudo apt-get update -y
+          sudo apt-get install -y jq rsync sshpass openssh-server netcat-openbsd curl
 
-          RESPONSE=$(curl -sS -w "\nHTTP_CODE:%{http_code}" \
-            -d "grant_type=client_credentials" \
-            -d "client_id=${TS_CLIENT_ID}" \
-            -d "client_secret=${TS_CLIENT_SECRET}" \
-            --data-urlencode "scope=all" \
-            "https://api.tailscale.com/api/v2/oauth/token")
-
-          HTTP_CODE=$(echo "$RESPONSE" | grep "HTTP_CODE:" | cut -d: -f2)
-          BODY=$(echo "$RESPONSE" | grep -v "HTTP_CODE:")
-
-          echo "HTTP Status Code: $HTTP_CODE"
-
-          if [ "$HTTP_CODE" != "200" ]; then
-            echo "❌ Failed to get OAuth token (HTTP $HTTP_CODE)"
-            echo "Response: $BODY"
-            exit 1
-          fi
-
-          ACCESS_TOKEN=$(echo "$BODY" | jq -r '.access_token')
-          TOKEN_SCOPE=$(echo "$BODY" | jq -r '.scope // ""')
-
-          if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" = "null" ]; then
-            echo "❌ Invalid access token received"
-            echo "Response: $BODY"
-            exit 1
-          fi
-
-          echo "✅ OAuth token acquired"
-          echo "ℹ️  Granted scope: $TOKEN_SCOPE"
-
-          # Hard gate: this workflow needs create auth keys + device management.
-          if [[ "$TOKEN_SCOPE" != *"auth_keys"* ]] || [[ "$TOKEN_SCOPE" != *"devices:core"* && "$TOKEN_SCOPE" != *"all"* ]]; then
-            echo ""
-            echo "❌ OAuth client doesn't have enough permissions for this workflow."
-            echo "   Required: auth_keys + devices:core (or all)"
-            echo "   Granted : $TOKEN_SCOPE"
-            echo ""
-            echo "👉 Fix:"
-            echo "   - In Tailscale Admin Console → Trust credentials → OAuth:"
-            echo "     enable WRITE for Auth keys and Devices (devices:core), and allow tag:ci (or your tag)."
-            echo "   - Owners/Admins can grant any scopes/tags; other roles may be limited."
-            exit 1
-          fi
-
-          echo "token=$ACCESS_TOKEN" >> $GITHUB_OUTPUT
-          echo "scope=$TOKEN_SCOPE" >> $GITHUB_OUTPUT
-          echo "tags=$TS_OAUTH_TAGS" >> $GITHUB_OUTPUT
-
-      - name: Create Tailscale Auth Key
-        id: ts-authkey
-        env:
-          ACCESS_TOKEN: ${{ steps.ts-oauth.outputs.token }}
+      - name: Install Tailscale
         run: |
-          echo "🔑 Creating reusable and ephemeral auth key..."
+          set -euo pipefail
+          curl -fsSL https://tailscale.com/install.sh | sh
 
-          # Create auth key with API (using '-' as tailnet - auto-detect from token)
-          RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -X POST \
-            -H "Authorization: Bearer ${ACCESS_TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d '{
-              "capabilities": {
-                "devices": {
-                  "create": {
-                    "reusable": true,
-                    "ephemeral": true,
-                    "preauthorized": true,
-                    "tags": ["tag:ci"]
-                  }
-                }
-              },
-              "expirySeconds": 7776000,
-              "description": "gha-smart-sync auth key"
-            }' \
-            "https://api.tailscale.com/api/v2/tailnet/-/keys")
-
-          HTTP_CODE=$(echo "$RESPONSE" | grep "HTTP_CODE:" | cut -d: -f2)
-          BODY=$(echo "$RESPONSE" | grep -v "HTTP_CODE:")
-
-          echo "HTTP Status Code: $HTTP_CODE"
-
-          if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "201" ]; then
-            echo "❌ Failed to create auth key (HTTP $HTTP_CODE)"
-            echo "Response: $BODY"
-            exit 1
-          fi
-
-          AUTH_KEY=$(echo "$BODY" | jq -r '.key')
-
-          if [ -z "$AUTH_KEY" ] || [ "$AUTH_KEY" = "null" ]; then
-            echo "❌ Invalid auth key received"
-            echo "Response: $BODY"
-            exit 1
-          fi
-
-          echo "authkey=$AUTH_KEY" >> $GITHUB_OUTPUT
-          echo "✅ Auth key created (reusable, ephemeral, 90 days expiry)"
-
-      - name: Setup Tailscale
+      - name: Connect to Tailscale using OAuth client secret
+        id: tailscale
         env:
-          AUTH_KEY: ${{ steps.ts-authkey.outputs.authkey }}
+          TS_OAUTH_SECRET: ${{ secrets.TAILSCALE_OAUTH_CLIENT_SECRET }}
+          TS_TAGS_SECRET: ${{ secrets.TAILSCALE_TAGS }}
           RUNNER_ID: ${{ steps.runner-id.outputs.id }}
         run: |
           set -euo pipefail
-          echo "📦 Installing Tailscale..."
-          curl -fsSL https://tailscale.com/install.sh | sh
+
+          TAGS="${TS_TAGS_SECRET:-${DEFAULT_TAILSCALE_TAGS}}"
+          echo "🏷️ Using tags: $TAGS"
+
+          # Start daemon in-memory (good for ephemeral CI runners)
           sudo tailscaled --state=mem: &
 
-          echo "🔐 Connecting to Tailscale network..."
-          sudo tailscale up --auth-key="${AUTH_KEY}" --hostname="gh-${RUNNER_ID}" --accept-routes --accept-dns
+          # ✅ OAuth secret can be used directly as --auth-key
+          # ✅ URL-style params supported: ephemeral, preauthorized, baseURL
+          # 👉 We want: ephemeral=true, preauthorized=true
+          sudo tailscale up \
+            --auth-key="${TS_OAUTH_SECRET}?ephemeral=true&preauthorized=true" \
+            --advertise-tags="${TAGS}" \
+            --hostname="gh-${RUNNER_ID}" \
+            --accept-dns=true \
+            --accept-routes=true
 
-          echo "✅ Connected. My Tailscale IPv4: $(tailscale ip -4)"
+          TS_IP=$(tailscale ip -4)
+          TS_HOSTNAME=$(tailscale status --self | awk '{print $2}')
+
+          echo "ip=$TS_IP" >> $GITHUB_OUTPUT
+          echo "hostname=$TS_HOSTNAME" >> $GITHUB_OUTPUT
+
+          echo "✅ Connected"
+          echo "   Hostname: $TS_HOSTNAME"
+          echo "   IP      : $TS_IP"
           sudo tailscale status --peers || true
 
-      - name: Setup SSH Server
+      - name: Setup SSH server (shared password)
         id: ssh-setup
+        env:
+          RUNNER_SSH_PASSWORD: ${{ secrets.RUNNER_SSH_PASSWORD }}
         run: |
           set -euo pipefail
-          echo "🔧 Configuring SSH server..."
 
-          sudo apt-get update -y
-          sudo apt-get install -y openssh-server rsync sshpass jq
+          if [ -z "${RUNNER_SSH_PASSWORD:-}" ]; then
+            echo "❌ Missing secret RUNNER_SSH_PASSWORD"
+            exit 1
+          fi
 
-          sudo systemctl enable ssh
-          sudo systemctl start ssh
-
-          # Create a dedicated user for sync
+          # Create runner user
           if ! id -u runner >/dev/null 2>&1; then
             sudo useradd -m -s /bin/bash runner
           fi
 
-          SSH_PASS="pw-$(date +%s)-$RANDOM"
-          echo "SSH password generated"
+          # Set shared password for cross-runner rsync/ssh
+          echo "runner:${RUNNER_SSH_PASSWORD}" | sudo chpasswd
 
-          echo "runner:${SSH_PASS}" | sudo chpasswd
+          # Allow runner to run tailscale/shutdown without password (for remote stop)
+          echo "runner ALL=(ALL) NOPASSWD: /usr/bin/tailscale, /sbin/shutdown, /bin/systemctl, /usr/sbin/service" | sudo tee /etc/sudoers.d/runner-nopasswd >/dev/null
+          sudo chmod 440 /etc/sudoers.d/runner-nopasswd
 
-          sudo mkdir -p /home/runner/.ssh
-          sudo chmod 700 /home/runner/.ssh
-          sudo chown -R runner:runner /home/runner/.ssh
+          # Ensure SSH is up
+          sudo systemctl enable ssh
+          sudo systemctl restart ssh
 
-          # Wait ssh
+          # Wait for port
           for i in $(seq 1 10); do
             if nc -z localhost 22; then
               break
@@ -191,45 +119,39 @@ jobs:
             sleep 1
           done
 
-          echo "ssh_pass=$SSH_PASS" >> $GITHUB_OUTPUT
+          echo "ssh_user=runner" >> $GITHUB_OUTPUT
 
       # ============================================================
       # 🔍 DISCOVER ACTIVE RUNNER (GIỮ NGUYÊN LOGIC CỦA BẠN)
       # ============================================================
       - name: Discover Active Runners
         id: discover
-        env:
-          ACCESS_TOKEN: ${{ steps.ts-oauth.outputs.token }}
         run: |
+          set -euo pipefail
           echo "🔍 Discovering active runners in Tailscale network..."
 
-          # Get list of all online peers (excluding self)
           SELF_HOSTNAME=$(tailscale status --self | awk '{print $2}')
           echo "Self hostname: $SELF_HOSTNAME"
 
-          # Find active runners starting with 'gh-' (exclude self and offline nodes)
-          ACTIVE_RUNNERS=$(sudo tailscale status --peers | awk '$0 !~ /offline/ {print $1" "$2}' | grep "gh-" | grep -v "$SELF_HOSTNAME" | awk '{print $1}' || echo "")
+          # Pick first online peer whose hostname starts with gh- (excluding self)
+          ACTIVE_LINE=$(sudo tailscale status --peers | awk '$0 !~ /offline/ {print $0}' | grep "gh-" | grep -v "$SELF_HOSTNAME" | head -n 1 || true)
 
-          if [ -z "$ACTIVE_RUNNERS" ]; then
+          if [ -z "$ACTIVE_LINE" ]; then
             echo "found=false" >> $GITHUB_OUTPUT
             echo "📭 No active runners found in network"
-          else
-            # Get first active runner
-            ACTIVE_IP=$(echo "$ACTIVE_RUNNERS" | head -1)
-            ACTIVE_HOSTNAME=$(sudo tailscale status | grep "$ACTIVE_IP" | awk '{print $2}')
-
-            echo "found=true" >> $GITHUB_OUTPUT
-            echo "ip=$ACTIVE_IP" >> $GITHUB_OUTPUT
-            echo "hostname=$ACTIVE_HOSTNAME" >> $GITHUB_OUTPUT
-
-            echo "✅ Found active runner:"
-            echo "   Hostname: $ACTIVE_HOSTNAME"
-            echo "   IP: $ACTIVE_IP"
-
-            # Extract runner ID from hostname (gh-XXXXX)
-            REMOTE_RUNNER_ID=$(echo "$ACTIVE_HOSTNAME" | sed 's/gh-//')
-            echo "remote_runner_id=$REMOTE_RUNNER_ID" >> $GITHUB_OUTPUT
+            exit 0
           fi
+
+          ACTIVE_IP=$(echo "$ACTIVE_LINE" | awk '{print $1}')
+          ACTIVE_HOSTNAME=$(echo "$ACTIVE_LINE" | awk '{print $2}')
+
+          echo "found=true" >> $GITHUB_OUTPUT
+          echo "ip=$ACTIVE_IP" >> $GITHUB_OUTPUT
+          echo "hostname=$ACTIVE_HOSTNAME" >> $GITHUB_OUTPUT
+
+          echo "✅ Found active runner:"
+          echo "   Hostname: $ACTIVE_HOSTNAME"
+          echo "   IP: $ACTIVE_IP"
 
       - name: Sync Data FROM Active Runner
         if: steps.discover.outputs.found == 'true'
@@ -237,18 +159,17 @@ jobs:
         env:
           ACTIVE_IP: ${{ steps.discover.outputs.ip }}
           ACTIVE_HOSTNAME: ${{ steps.discover.outputs.hostname }}
-          REMOTE_RUNNER_ID: ${{ steps.discover.outputs.remote_runner_id }}
-          RUNNER_ID: ${{ steps.runner-id.outputs.id }}
-          REMOTE_PASS: ${{ steps.ssh-setup.outputs.ssh_pass }}
+          RUNNER_SSH_PASSWORD: ${{ secrets.RUNNER_SSH_PASSWORD }}
         run: |
+          set -euo pipefail
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo "📥 SYNCING DATA FROM ACTIVE RUNNER"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo "Source: $ACTIVE_HOSTNAME ($ACTIVE_IP)"
-          echo "Target: gh-$RUNNER_ID ($(tailscale ip -4))"
+          echo "Target: ${{ steps.tailscale.outputs.hostname }} (${{ steps.tailscale.outputs.ip }})"
           echo ""
 
-          mkdir -p ${{ env.DATA_DIR }}
+          mkdir -p "${{ env.DATA_DIR }}"
 
           echo "⏳ Waiting for SSH on $ACTIVE_IP:${{ env.SYNC_PORT }}..."
           for i in $(seq 1 30); do
@@ -265,109 +186,70 @@ jobs:
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
           RSYNC_LOG="/tmp/rsync-sync.log"
-          RSYNC_STATS="/tmp/rsync-stats.txt"
-
-          if sshpass -p "$REMOTE_PASS" rsync -avz --stats --timeout=60 \
+          if sshpass -p "$RUNNER_SSH_PASSWORD" rsync -avz --stats --timeout=60 \
             -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10" \
             runner@$ACTIVE_IP:${{ env.DATA_DIR }}/ \
             ${{ env.DATA_DIR }}/ 2>&1 | tee "$RSYNC_LOG"; then
 
-            echo ""
-            echo "✅ Rsync completed successfully"
-
-            grep -A 20 "Number of files" "$RSYNC_LOG" > "$RSYNC_STATS" || true
-
             SYNCED_FILES=$(find ${{ env.DATA_DIR }} -type f | wc -l)
             SYNCED_SIZE=$(du -sh ${{ env.DATA_DIR }} 2>/dev/null | awk '{print $1}')
             SYNCED_BYTES=$(du -sb ${{ env.DATA_DIR }} 2>/dev/null | awk '{print $1}')
-
-            echo ""
-            echo "📊 Sync Statistics:"
-            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            echo "   Total files synced: $SYNCED_FILES"
-            echo "   Total size        : $SYNCED_SIZE"
-            echo "   Total bytes       : $SYNCED_BYTES"
 
             echo "synced=true" >> $GITHUB_OUTPUT
             echo "files=$SYNCED_FILES" >> $GITHUB_OUTPUT
             echo "size=$SYNCED_SIZE" >> $GITHUB_OUTPUT
             echo "bytes=$SYNCED_BYTES" >> $GITHUB_OUTPUT
 
-            echo ""
-            echo "📋 Synced files list:"
-            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            ls -lah ${{ env.DATA_DIR }}/ | tail -n +4 | head -20
-            if [ "$SYNCED_FILES" -gt 20 ]; then
-              echo "   ... and $((SYNCED_FILES - 20)) more files"
-            fi
-
+            echo "✅ Sync done: $SYNCED_FILES files, $SYNCED_SIZE"
           else
-            echo ""
             echo "❌ Rsync failed"
-            cat "$RSYNC_LOG" | tail -20
+            tail -n 30 "$RSYNC_LOG" || true
             echo "synced=false" >> $GITHUB_OUTPUT
           fi
 
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-
-      - name: Remove Active Runner from Network
+      - name: Stop previous runner via SSH (no API needed)
         if: steps.discover.outputs.found == 'true' && steps.sync-from.outputs.synced == 'true'
         env:
-          ACCESS_TOKEN: ${{ steps.ts-oauth.outputs.token }}
-          ACTIVE_HOSTNAME: ${{ steps.discover.outputs.hostname }}
+          ACTIVE_IP: ${{ steps.discover.outputs.ip }}
+          RUNNER_SSH_PASSWORD: ${{ secrets.RUNNER_SSH_PASSWORD }}
         run: |
           set -euo pipefail
-          echo "🔴 Removing active runner from Tailscale network..."
+          echo "🛑 Stopping previous runner (best-effort) via SSH..."
 
-          DEVICES=$(curl -s -H "Authorization: Bearer ${ACCESS_TOKEN}" \
-            "https://api.tailscale.com/api/v2/tailnet/-/devices")
+          # Best effort: ask the old runner to disconnect from tailscale and shutdown
+          sshpass -p "$RUNNER_SSH_PASSWORD" ssh \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -o ConnectTimeout=10 \
+            runner@$ACTIVE_IP \
+            "sudo tailscale down || true; sudo shutdown -h now || true" || true
 
-          DEVICE_ID=$(echo "$DEVICES" | jq -r --arg hn "$ACTIVE_HOSTNAME" '.devices[] | select(.hostname==$hn) | .id' | head -n 1)
+          echo "✅ Stop signal sent (best-effort)"
 
-          if [ -z "$DEVICE_ID" ] || [ "$DEVICE_ID" = "null" ]; then
-            echo "⚠️ Could not find device id for $ACTIVE_HOSTNAME; skipping delete."
-            exit 0
-          fi
-
-          DELETE_RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -X DELETE \
-            -H "Authorization: Bearer ${ACCESS_TOKEN}" \
-            "https://api.tailscale.com/api/v2/device/${DEVICE_ID}")
-
-          HTTP_CODE=$(echo "$DELETE_RESPONSE" | grep "HTTP_CODE:" | cut -d: -f2)
-
-          if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "204" ]; then
-            echo "✅ Successfully removed $ACTIVE_HOSTNAME from network"
-            echo "   Device will be automatically cleaned up (ephemeral mode)"
-          else
-            echo "⚠️ Failed to remove device (HTTP $HTTP_CODE)"
-            echo "Response: $(echo "$DELETE_RESPONSE" | grep -v "HTTP_CODE:")"
-          fi
-
-      - name: Initialize/Update local data (no active runner found)
-        if: steps.discover.outputs.found != 'true'
-        run: |
-          echo "📝 Initializing/Updating local data..."
-          mkdir -p ${{ env.DATA_DIR }}
-          echo "created_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" > ${{ env.DATA_DIR }}/meta.txt
-
-      - name: Your actual job steps
-        run: |
-          echo "✅ Place your build/sync tasks here"
-          # e.g. write something into $DATA_DIR so it persists
-          echo "last_run=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> ${{ env.DATA_DIR }}/meta.txt
-
-      - name: Keep SSH available for next runner
+      - name: Initialize/Update local data
         env:
           RUNNER_ID: ${{ steps.runner-id.outputs.id }}
         run: |
-          echo "📡 Runner is now ready to serve data to the next runner."
-          echo "   Hostname: gh-${RUNNER_ID}"
-          echo "   IP      : $(tailscale ip -4)"
-          echo "Monitoring connections..."
-          # Keep alive a bit so peer can rsync in (tweak as needed)
+          set -euo pipefail
+          mkdir -p "${{ env.DATA_DIR }}"
+          echo "runner_id=${RUNNER_ID}" > "${{ env.DATA_DIR }}/meta.txt"
+          echo "hostname=${{ steps.tailscale.outputs.hostname }}" >> "${{ env.DATA_DIR }}/meta.txt"
+          echo "ip=${{ steps.tailscale.outputs.ip }}" >> "${{ env.DATA_DIR }}/meta.txt"
+          echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${{ env.DATA_DIR }}/meta.txt"
+          echo "run_id=${{ github.run_id }}" >> "${{ env.DATA_DIR }}/meta.txt"
+          echo "run_number=${{ github.run_number }}" >> "${{ env.DATA_DIR }}/meta.txt"
+
+      - name: Keep runner alive for next sync
+        run: |
+          set -euo pipefail
+          echo "📡 Runner is ready for next job to sync from it."
+          echo "   Hostname: ${{ steps.tailscale.outputs.hostname }}"
+          echo "   IP      : ${{ steps.tailscale.outputs.ip }}"
+          echo "   SSH     : runner@${{ steps.tailscale.outputs.ip }}:${{ env.SYNC_PORT }}"
+          echo ""
+          # Keep alive a bit (tweak as needed)
           for i in $(seq 1 30); do
             sleep 10
-            echo "⏱️  [$((i/6)):$(( (i%6)*10 ))] Status check..."
             sudo tailscale status --peers | head -n 20 || true
           done
 
@@ -376,4 +258,4 @@ jobs:
         run: |
           echo "🧹 Cleaning up Tailscale connection..."
           sudo tailscale down || true
-          echo "✅ Cleanup completed - ephemeral device will auto-remove"
+          echo "✅ Cleanup completed"
