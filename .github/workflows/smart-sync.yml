@@ -65,9 +65,9 @@ jobs:
         env:
           ACCESS_TOKEN: ${{ steps.ts-oauth.outputs.token }}
         run: |
-          echo "🔑 Creating reusable and ephemeral auth key..."
+          echo "🔑 Creating ephemeral and preauthorized auth key (no tags)..."
 
-          # Create auth key with API (using '-' as tailnet - auto-detect from token)
+          # Create auth key without tags - user-owned key
           RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -X POST \
             -H "Authorization: Bearer ${ACCESS_TOKEN}" \
             -H "Content-Type: application/json" \
@@ -75,9 +75,10 @@ jobs:
               "capabilities": {
                 "devices": {
                   "create": {
-                    "reusable": true,
+                    "reusable": false,
                     "ephemeral": true,
-                    "preauthorized": true
+                    "preauthorized": true,
+                    "tags": []
                   }
                 }
               },
@@ -105,7 +106,7 @@ jobs:
           fi
 
           echo "authkey=$AUTH_KEY" >> $GITHUB_OUTPUT
-          echo "✅ Auth key created (reusable, ephemeral, 1 hour expiry)"
+          echo "✅ Auth key created (ephemeral, preauthorized, no tags, 1 hour expiry)"
 
       - name: Setup Tailscale
         env:
