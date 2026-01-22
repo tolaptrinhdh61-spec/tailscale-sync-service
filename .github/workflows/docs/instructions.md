@@ -1,0 +1,2 @@
+- Chạy các runner trên github actions, pipelize azure
+- Tạo các yml để chạy (đơn giản, đừng quá rắc rối), để kiểm thử kết nối các runner thông qua tailscale
